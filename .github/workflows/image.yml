@@ -1,11 +1,13 @@
 ---
-# Build the WASM game into an nginx image and publish it to GHCR on `v*` tags.
+# Build the WASM game into an nginx image, smoke-test it, and publish it to
+# GHCR on `vX.Y.Z` tags.
 #
 # Runs on GitHub-hosted runners only: this repository is public, so a pull
 # request from a fork must never execute on a self-hosted machine.
 #
 # One tag per release (`X.Y.Z`), no `latest` and no `sha-*`: every extra tag is
-# another stored version. Pull requests build the image without pushing it.
+# another stored version. Pull requests build and smoke-test the image without
+# pushing it; fork PRs get a read-only GITHUB_TOKEN and no secrets.
 #
 # Multi-arch costs almost nothing here: the Rust/Trunk stage runs once on the
 # runner's native platform (`--platform=$BUILDPLATFORM`) and its WASM output is
@@ -16,7 +18,7 @@ name: Container image
 
 on:
   push:
-    tags: ["v*"]
+    tags: ["v*.*.*"]
   pull_request:
   workflow_dispatch:
 
@@ -55,6 +57,22 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           flavor: latest=false
           tags: type=semver,pattern={{version}}
+
+      # Smoke-test the image as deployed before anything is published. Only the
+      # runner's native platform can be loaded into the local engine; the
+      # multi-arch step below reuses this build's layers from the builder cache.
+      - name: Build for smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: kilowatt-tycoon:smoke
+          cache-from: type=gha
+
+      - name: Smoke test
+        run: docker/smoke-test.sh kilowatt-tycoon:smoke
 
       - name: Build (and push on tags)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
