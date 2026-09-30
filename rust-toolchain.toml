@@ -1,0 +1,14 @@
+# Single source of truth for the Rust toolchain: CI, the container image build
+# and local builds all use this exact version, so what CI validates is what
+# ships.
+#
+# Each Clippy release adds lints, and CI runs it with `-D warnings`: a floating
+# `stable` turns CI red without any code change (upstream CI has been red since
+# 2026-07 for that reason alone). Bump this deliberately, and fix the new lints
+# in the same change.
+#
+# 1.94.0 was stable at the last green upstream CI run (e51f26d, 2026-03-11).
+[toolchain]
+channel = "1.94.0"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]
