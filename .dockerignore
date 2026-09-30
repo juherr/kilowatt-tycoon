@@ -5,3 +5,5 @@ dist
 tests/e2e/node_modules
 **/*.hash
 .env
+# Brand kit (AI/EPS/PDF/JPG, ~72 MB): referenced nowhere at runtime.
+assets/logokit
