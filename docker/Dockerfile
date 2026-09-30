@@ -31,8 +31,9 @@ COPY . .
 
 # The Supabase leaderboard stays disabled: SUPABASE_URL / SUPABASE_ANON_KEY are
 # deliberately not provided. Trunk downloads wasm-bindgen (version from
-# Cargo.lock) and wasm-opt at build time.
-RUN trunk build --release
+# Cargo.lock) and wasm-opt at build time. --locked fails the build instead of
+# silently re-resolving dependencies when Cargo.lock is out of date.
+RUN trunk build --release --locked
 
 FROM nginxinc/nginx-unprivileged:1.31.6-alpine
 
