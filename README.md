@@ -40,6 +40,22 @@ cargo test
 python3 tools/build_assets.py
 ```
 
+### CSMS provisioning
+
+Native builds can provision newly created chargers through the language-neutral
+`csms-driver` daemon. Start the daemon separately, then configure the game:
+
+```bash
+CSMS_DRIVER_URL=http://127.0.0.1:8787 cargo run
+```
+
+Provisioning is disabled when `CSMS_DRIVER_URL` is unset; the game remains
+playable locally. Optional settings are `CSMS_DRIVER_TIMEOUT_MS` (defaults to
+60000), `CSMS_DRIVER_SECURITY_PROFILE` (defaults to `0`), and
+`CSMS_DRIVER_BASIC_AUTH_PASSWORD` for security profiles 1 or 2. The password
+is sent only in the provisioning request and is redacted from client errors.
+Browser builds do not call the daemon directly.
+
 ### WASM
 
 Test the game locally in the browser:

@@ -3,6 +3,7 @@
 pub mod achievements;
 pub mod asset_handles;
 pub mod build_state;
+pub mod charger_identity;
 pub mod charger_queue;
 pub mod demand;
 pub mod fleet;
@@ -32,6 +33,7 @@ use bevy::prelude::*;
 pub use achievements::*;
 pub use asset_handles::*;
 pub use build_state::*;
+pub use charger_identity::*;
 pub use charger_queue::*;
 pub use demand::*;
 pub use fleet::*;
