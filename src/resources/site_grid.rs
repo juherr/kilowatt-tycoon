@@ -324,6 +324,8 @@ pub struct Tile {
     pub charger_entity: Option<Entity>,
     /// Charger type if this is a charger pad
     pub charger_type: Option<ChargerPadType>,
+    /// Unique placement identity retained across charger entity reconstruction.
+    pub charger_instance_id: Option<String>,
     /// Whether this bay has a charger next to it (DEPRECATED - use linked_charger_pad)
     pub has_adjacent_charger: bool,
     /// Whether this tile is locked (cannot be sold)
@@ -343,6 +345,7 @@ impl Default for Tile {
             visual_entity: None,
             charger_entity: None,
             charger_type: None,
+            charger_instance_id: None,
             has_adjacent_charger: false,
             is_locked: false,
             anchor_pos: None,
@@ -823,6 +826,19 @@ impl SiteGrid {
         self.tiles.get_mut(&(x, y))
     }
 
+    /// Return the placement identity for a charger pad, creating one for legacy asset pads.
+    pub fn ensure_charger_instance_id(&mut self, x: i32, y: i32) -> Option<String> {
+        let tile = self.get_tile_mut(x, y)?;
+        if tile.content != TileContent::ChargerPad || tile.charger_type.is_none() {
+            return None;
+        }
+        Some(
+            tile.charger_instance_id
+                .get_or_insert_with(new_charger_instance_id)
+                .clone(),
+        )
+    }
+
     /// Get tile content at coordinates
     pub fn get_content(&self, x: i32, y: i32) -> TileContent {
         self.tiles
@@ -1130,6 +1146,7 @@ impl SiteGrid {
         self.set_tile_content(pad_x, pad_y, TileContent::ChargerPad);
         if let Some(tile) = self.get_tile_mut(pad_x, pad_y) {
             tile.charger_type = Some(charger_type);
+            tile.charger_instance_id = Some(new_charger_instance_id());
             tile.linked_parking_bay = Some((bay_x, bay_y));
         }
 
@@ -1332,6 +1349,7 @@ impl SiteGrid {
             if let Some(tile_mut) = self.get_tile_mut(x, y) {
                 tile_mut.content = TileContent::Lot;
                 tile_mut.charger_type = None;
+                tile_mut.charger_instance_id = None;
                 tile_mut.charger_entity = None;
                 tile_mut.linked_parking_bay = None;
             }
@@ -1362,6 +1380,7 @@ impl SiteGrid {
             if let Some(pad_tile_mut) = self.get_tile_mut(pad_x, pad_y) {
                 pad_tile_mut.content = TileContent::Lot;
                 pad_tile_mut.charger_type = None;
+                pad_tile_mut.charger_instance_id = None;
                 pad_tile_mut.charger_entity = None;
                 pad_tile_mut.linked_parking_bay = None;
             }
@@ -1393,6 +1412,7 @@ impl SiteGrid {
             if let Some(tile_mut) = self.get_tile_mut(x, y) {
                 tile_mut.has_adjacent_charger = false;
                 tile_mut.charger_type = None;
+                tile_mut.charger_instance_id = None;
                 tile_mut.charger_entity = None;
             }
             self.mark_changed();
@@ -1471,6 +1491,7 @@ impl SiteGrid {
             tile.content = TileContent::Grass;
             tile.charger_entity = None;
             tile.charger_type = None;
+            tile.charger_instance_id = None;
             tile.has_adjacent_charger = false;
             tile.anchor_pos = None;
         }
@@ -1670,6 +1691,10 @@ impl SiteGrid {
     }
 }
 
+fn new_charger_instance_id() -> String {
+    format!("{:032x}", rand::random::<u128>())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1710,6 +1735,27 @@ mod tests {
         let pad_tile = grid.get_tile(5, 6).expect("Pad tile should exist");
         assert_eq!(pad_tile.content, TileContent::ChargerPad);
         assert_eq!(pad_tile.charger_type, Some(ChargerPadType::DCFC150));
+        assert!(pad_tile.charger_instance_id.is_some());
+    }
+
+    #[test]
+    fn charger_instance_id_survives_reconstruction_but_replacement_gets_a_new_id() {
+        let mut grid = create_test_grid_with_parking_bay();
+        grid.place_charger(5, 5, ChargerPadType::L2).unwrap();
+        let first = grid.ensure_charger_instance_id(5, 6).unwrap();
+
+        let mut reconstructed = grid.clone();
+        assert_eq!(
+            reconstructed.ensure_charger_instance_id(5, 6),
+            Some(first.clone())
+        );
+        reconstructed.sell(5, 6).unwrap();
+        reconstructed
+            .place_charger(5, 5, ChargerPadType::L2)
+            .unwrap();
+
+        let replacement = reconstructed.ensure_charger_instance_id(5, 6).unwrap();
+        assert_ne!(replacement, first);
     }
 
     #[test]

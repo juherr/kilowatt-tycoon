@@ -190,6 +190,9 @@ impl CsmsDriverClient {
                     .as_ref()
                     .is_some_and(|password| !password.is_empty())
             || matches!(config.security_profile, 0 | 3) && config.basic_auth_password.is_some()
+            || matches!(config.security_profile, 1 | 2)
+                && parsed_url.scheme() != "https"
+                && !is_loopback_http(&parsed_url)
         {
             return Err(CsmsDriverError::new(
                 CsmsDriverErrorKind::InvalidConfiguration,
@@ -269,6 +272,7 @@ impl CsmsDriverClient {
             && existing.registration == desired.registration
             && existing.security.profile == desired.security.profile
             && existing.description.as_deref() == Some(desired.description.as_str())
+            && desired.security.basic_auth_password.is_none()
     }
 
     async fn get_driver(&self) -> Result<DriverDetails, CsmsDriverError> {
@@ -385,6 +389,21 @@ impl CsmsDriverClient {
             CsmsDriverError::new(CsmsDriverErrorKind::HttpFailure)
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_loopback_http(url: &reqwest::Url) -> bool {
+    if url.scheme() != "http" {
+        return false;
+    }
+    url.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -531,13 +550,17 @@ pub enum CsmsProvisioningState {
 pub struct ProvisioningTaskRegistry(Vec<(Entity, Task<Result<(), CsmsDriverError>>)>);
 
 fn stable_charger_key(charger: &Charger, site: Option<&BelongsToSite>) -> Option<String> {
-    charger.grid_position.is_none().then(|| {
-        format!(
-            "authored:{}:{}",
-            site.map(|tag| tag.site_id.0).unwrap_or_default(),
-            charger.id
-        )
-    })
+    let site_id = site.map(|tag| tag.site_id.0).unwrap_or_default();
+    charger
+        .grid_instance_id
+        .as_ref()
+        .map(|instance_id| format!("grid:{site_id}:{instance_id}"))
+        .or_else(|| {
+            charger
+                .grid_position
+                .is_none()
+                .then(|| format!("authored:{site_id}:{}", charger.id))
+        })
 }
 
 fn assign_identity(
@@ -565,10 +588,23 @@ pub fn assign_charger_identities(
     client: Option<Res<CsmsDriverClient>>,
     config_error: Option<Res<CsmsConfigurationError>>,
     mut tasks: ResMut<ProvisioningTaskRegistry>,
-    mut chargers: Query<(Entity, &mut Charger, Option<&BelongsToSite>), Added<Charger>>,
+    mut chargers: Query<
+        (
+            Entity,
+            &mut Charger,
+            Option<&BelongsToSite>,
+            Option<&CsmsProvisioningState>,
+        ),
+        Or<(Added<Charger>, Changed<CsmsProvisioningState>)>,
+    >,
 ) {
-    for (entity, mut charger, site) in &mut chargers {
-        if let Err(kind) = assign_identity(&mut charger, site, &mut identities) {
+    for (entity, mut charger, site, state) in &mut chargers {
+        if !charger.cp_id.is_empty() && state.is_some() {
+            continue;
+        }
+        if charger.cp_id.is_empty()
+            && let Err(kind) = assign_identity(&mut charger, site, &mut identities)
+        {
             warn!("Charger identity assignment failed: {kind}");
             commands
                 .entity(entity)
@@ -641,6 +677,150 @@ mod tests {
             Some(&CsmsProvisioningState::NotConfigured)
         );
     }
+
+    #[test]
+    fn retries_identity_store_failures_without_reallocating_on_configuration_errors() {
+        let mut app = App::new();
+        app.insert_resource(ChargerIdentityRegistry::in_memory_with_one_failed_save())
+            .init_resource::<ProvisioningTaskRegistry>()
+            .add_systems(Update, assign_charger_identities);
+        let entity = app.world_mut().spawn(Charger::default()).id();
+
+        app.update();
+        assert!(app.world().get::<Charger>(entity).unwrap().cp_id.is_empty());
+        assert_eq!(
+            app.world().get::<CsmsProvisioningState>(entity),
+            Some(&CsmsProvisioningState::Failed(
+                CsmsDriverErrorKind::IdentityStoreUnavailable
+            ))
+        );
+
+        app.update();
+        assert_eq!(
+            app.world().get::<Charger>(entity).unwrap().cp_id,
+            "KT-00000001"
+        );
+        assert_eq!(
+            app.world()
+                .resource::<ChargerIdentityRegistry>()
+                .allocated_count(),
+            1
+        );
+
+        app.insert_resource(ChargerIdentityRegistry::in_memory())
+            .insert_resource(CsmsConfigurationError(
+                CsmsDriverErrorKind::InvalidConfiguration,
+            ));
+        let config_error_entity = app.world_mut().spawn(Charger::default()).id();
+        app.update();
+        app.update();
+        assert_eq!(
+            app.world()
+                .resource::<ChargerIdentityRegistry>()
+                .allocated_count(),
+            1
+        );
+        assert_eq!(
+            app.world()
+                .get::<CsmsProvisioningState>(config_error_entity),
+            Some(&CsmsProvisioningState::Failed(
+                CsmsDriverErrorKind::InvalidConfiguration
+            ))
+        );
+    }
+
+    #[test]
+    fn grid_reconstruction_keeps_identity_and_replacement_gets_a_new_one() {
+        let mut grid = crate::resources::SiteGrid::default();
+        grid.set_tile_content(5, 5, crate::resources::TileContent::ParkingBaySouth);
+        grid.set_tile_content(5, 6, crate::resources::TileContent::Lot);
+        grid.place_charger(5, 5, crate::resources::ChargerPadType::L2)
+            .unwrap();
+        let original_instance = grid.ensure_charger_instance_id(5, 6).unwrap();
+
+        let mut app = App::new();
+        app.insert_resource(ChargerIdentityRegistry::in_memory())
+            .init_resource::<ProvisioningTaskRegistry>()
+            .add_systems(Update, assign_charger_identities);
+        let spawn = |app: &mut App, instance_id: String| {
+            app.world_mut()
+                .spawn(Charger {
+                    id: "chg_grid".to_string(),
+                    grid_position: Some((5, 6)),
+                    grid_instance_id: Some(instance_id),
+                    ..default()
+                })
+                .id()
+        };
+
+        let first = spawn(&mut app, original_instance.clone());
+        app.update();
+        let first_cp_id = app.world().get::<Charger>(first).unwrap().cp_id.clone();
+        app.world_mut().despawn(first);
+
+        let reconstructed = spawn(&mut app, original_instance.clone());
+        app.update();
+        assert_eq!(
+            app.world().get::<Charger>(reconstructed).unwrap().cp_id,
+            first_cp_id
+        );
+
+        grid.sell(5, 6).unwrap();
+        grid.place_charger(5, 5, crate::resources::ChargerPadType::L2)
+            .unwrap();
+        let replacement_instance = grid.ensure_charger_instance_id(5, 6).unwrap();
+        assert_ne!(replacement_instance, original_instance);
+        app.world_mut().despawn(reconstructed);
+
+        let replacement = spawn(&mut app, replacement_instance);
+        app.update();
+        assert_ne!(
+            app.world().get::<Charger>(replacement).unwrap().cp_id,
+            first_cp_id
+        );
+    }
+
+    #[test]
+    fn completed_provisioning_task_ignores_a_removed_charger() {
+        let pool = bevy::tasks::TaskPool::new();
+        let (complete_tx, complete_rx) = std::sync::mpsc::channel();
+        let task = pool.spawn(async move {
+            complete_tx.send(()).unwrap();
+            Ok::<(), CsmsDriverError>(())
+        });
+        complete_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("task should complete");
+
+        let mut app = App::new();
+        app.init_resource::<ProvisioningTaskRegistry>()
+            .add_systems(Update, poll_provisioning_tasks);
+        let entity = app.world_mut().spawn_empty().id();
+        app.world_mut().despawn(entity);
+        app.world_mut()
+            .resource_mut::<ProvisioningTaskRegistry>()
+            .0
+            .push((entity, task));
+
+        for _ in 0..100 {
+            app.update();
+            if app
+                .world()
+                .resource::<ProvisioningTaskRegistry>()
+                .0
+                .is_empty()
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            app.world()
+                .resource::<ProvisioningTaskRegistry>()
+                .0
+                .is_empty()
+        );
+    }
 }
 
 /// Poll provision requests without blocking the game update loop.
@@ -657,13 +837,13 @@ pub fn poll_provisioning_tasks(
                 Ok(()) => {
                     commands
                         .entity(*entity)
-                        .insert(CsmsProvisioningState::Provisioned);
+                        .try_insert(CsmsProvisioningState::Provisioned);
                 }
                 Err(error) => {
                     warn!("CSMS provisioning failed: {}", error.kind());
                     commands
                         .entity(*entity)
-                        .insert(CsmsProvisioningState::Failed(error.kind()));
+                        .try_insert(CsmsProvisioningState::Failed(error.kind()));
                 }
             }
             let (_, completed_task) = tasks.0.swap_remove(index);
@@ -691,10 +871,23 @@ fn poll_task<T>(task: &mut Task<T>) -> Option<T> {
 pub fn assign_charger_identities(
     mut commands: Commands,
     mut identities: ResMut<ChargerIdentityRegistry>,
-    mut chargers: Query<(Entity, &mut Charger, Option<&BelongsToSite>), Added<Charger>>,
+    mut chargers: Query<
+        (
+            Entity,
+            &mut Charger,
+            Option<&BelongsToSite>,
+            Option<&CsmsProvisioningState>,
+        ),
+        Or<(Added<Charger>, Changed<CsmsProvisioningState>)>,
+    >,
 ) {
-    for (entity, mut charger, site) in &mut chargers {
-        if let Err(kind) = assign_identity(&mut charger, site, &mut identities) {
+    for (entity, mut charger, site, state) in &mut chargers {
+        if !charger.cp_id.is_empty() && state.is_some() {
+            continue;
+        }
+        if charger.cp_id.is_empty()
+            && let Err(kind) = assign_identity(&mut charger, site, &mut identities)
+        {
             warn!("Charger identity assignment failed: {kind}");
             commands
                 .entity(entity)

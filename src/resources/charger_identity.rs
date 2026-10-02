@@ -1,6 +1,8 @@
 //! Durable allocation of external OCPP charge-point identities.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bevy::prelude::Resource;
 use serde::{Deserialize, Serialize};
@@ -98,9 +100,7 @@ impl ChargerIdentityRegistry {
     /// Return the stable ID associated with `stable_key`, or durably allocate
     /// a fresh ID. Passing `None` always allocates a fresh, never-reused ID.
     pub fn assign(&mut self, stable_key: Option<&str>) -> Result<String, IdentityRegistryError> {
-        if let Some(error) = &self.load_error {
-            return Err(IdentityRegistryError::StorageUnavailable(error.clone()));
-        }
+        self.retry_load_if_needed()?;
         if let Some(id) = stable_key.and_then(|key| self.data.assignments.get(key)) {
             return Ok(id.clone());
         }
@@ -128,6 +128,33 @@ impl ChargerIdentityRegistry {
         Ok(id)
     }
 
+    fn retry_load_if_needed(&mut self) -> Result<(), IdentityRegistryError> {
+        if self.load_error.is_none() {
+            return Ok(());
+        }
+
+        match self.storage.load() {
+            Ok(Some(data)) if data_is_valid(&data) => {
+                self.data = data;
+                self.load_error = None;
+                Ok(())
+            }
+            Ok(None) => {
+                self.data = RegistryData::default();
+                self.load_error = None;
+                Ok(())
+            }
+            Ok(Some(_)) => {
+                self.load_error = Some("identity registry is invalid".to_string());
+                Err(IdentityRegistryError::CorruptRegistry)
+            }
+            Err(error) => {
+                self.load_error = Some(error.clone());
+                Err(IdentityRegistryError::StorageUnavailable(error))
+            }
+        }
+    }
+
     pub fn allocated_count(&self) -> usize {
         self.data.allocated.len()
     }
@@ -135,6 +162,15 @@ impl ChargerIdentityRegistry {
     #[cfg(test)]
     pub(crate) fn in_memory() -> Self {
         Self::load_with_storage(Box::new(MemoryStorage::default()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory_with_one_failed_save() -> Self {
+        let storage = MemoryStorage::default();
+        storage
+            .fail_next_save
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Self::load_with_storage(Box::new(storage))
     }
 }
 
@@ -171,13 +207,62 @@ impl IdentityStorage for PlatformIdentityStorage {
             .map_err(|_| "identity registry directory could not be created".to_string())?;
         let bytes = serde_json::to_vec(data)
             .map_err(|_| "identity registry could not be encoded".to_string())?;
-        let mut file = std::fs::File::create(&self.0)
-            .map_err(|_| "identity registry could not be written".to_string())?;
-        use std::io::Write;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| "identity registry could not be persisted".to_string())
+        atomic_replace(&self.0, &bytes)
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(target_arch = "wasm32"))]
+fn atomic_replace(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_replace_with(path, bytes, |from, to| std::fs::rename(from, to))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn atomic_replace_with(
+    path: &std::path::Path,
+    bytes: &[u8],
+    replace: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| "identity registry path is invalid".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|_| "identity registry directory could not be created".to_string())?;
+    let filename = path
+        .file_name()
+        .ok_or_else(|| "identity registry path is invalid".to_string())?
+        .to_string_lossy();
+    let temp_path = loop {
+        let suffix = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(".{filename}.{}.{}.tmp", std::process::id(), suffix));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                let result = file.write_all(bytes).and_then(|_| file.sync_all());
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&candidate);
+                    return Err("identity registry could not be persisted".to_string());
+                }
+                break candidate;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return Err("identity registry temporary file could not be created".into()),
+        }
+    };
+
+    let result = replace(&temp_path, path).and_then(|_| std::fs::File::open(parent)?.sync_all());
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err("identity registry could not be persisted".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -229,8 +314,15 @@ impl IdentityStorage for PlatformIdentityStorage {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+fn platform_storage() -> Box<dyn IdentityStorage> {
+    Box::new(PlatformIdentityStorage)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 struct UnavailableStorage(&'static str);
 
+#[cfg(not(target_arch = "wasm32"))]
 impl IdentityStorage for UnavailableStorage {
     fn load(&self) -> Result<Option<RegistryData>, String> {
         Err(self.0.to_string())
@@ -243,16 +335,25 @@ impl IdentityStorage for UnavailableStorage {
 
 #[cfg(test)]
 #[derive(Clone, Default)]
-struct MemoryStorage(std::sync::Arc<std::sync::Mutex<Option<RegistryData>>>);
+struct MemoryStorage {
+    data: std::sync::Arc<std::sync::Mutex<Option<RegistryData>>>,
+    fail_next_save: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
 
 #[cfg(test)]
 impl IdentityStorage for MemoryStorage {
     fn load(&self) -> Result<Option<RegistryData>, String> {
-        Ok(self.0.lock().unwrap().clone())
+        Ok(self.data.lock().unwrap().clone())
     }
 
     fn save(&self, data: &RegistryData) -> Result<(), String> {
-        *self.0.lock().unwrap() = Some(data.clone());
+        if self
+            .fail_next_save
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err("simulated temporary write failure".to_string());
+        }
+        *self.data.lock().unwrap() = Some(data.clone());
         Ok(())
     }
 }
@@ -300,9 +401,44 @@ mod tests {
     }
 
     #[test]
+    fn retries_a_cached_load_failure_after_storage_recovers() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct RecoverableStorage {
+            available: std::sync::Arc<AtomicBool>,
+            data: MemoryStorage,
+        }
+
+        impl IdentityStorage for RecoverableStorage {
+            fn load(&self) -> Result<Option<RegistryData>, String> {
+                if self.available.load(Ordering::Relaxed) {
+                    self.data.load()
+                } else {
+                    Err("temporarily unavailable".to_string())
+                }
+            }
+
+            fn save(&self, data: &RegistryData) -> Result<(), String> {
+                self.data.save(data)
+            }
+        }
+
+        let available = std::sync::Arc::new(AtomicBool::new(false));
+        let storage = RecoverableStorage {
+            available: available.clone(),
+            data: MemoryStorage::default(),
+        };
+        let mut registry = ChargerIdentityRegistry::load_with_storage(Box::new(storage));
+        assert!(registry.assign(None).is_err());
+
+        available.store(true, Ordering::Relaxed);
+        assert_eq!(registry.assign(None).unwrap(), "KT-00000001");
+    }
+
+    #[test]
     fn corrupted_registry_disables_new_allocations() {
         let storage = MemoryStorage::default();
-        *storage.0.lock().unwrap() = Some(RegistryData {
+        *storage.data.lock().unwrap() = Some(RegistryData {
             version: REGISTRY_VERSION,
             next_id: 0,
             assignments: HashMap::new(),
@@ -310,5 +446,57 @@ mod tests {
         });
         let mut registry = ChargerIdentityRegistry::load_with_storage(Box::new(storage));
         assert!(registry.assign(None).is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn failed_atomic_replacement_preserves_the_last_valid_registry() {
+        let path = std::env::temp_dir().join(format!(
+            "kilowatt-tycoon-identity-test-{}-{}.json",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let previous = RegistryData {
+            version: REGISTRY_VERSION,
+            next_id: 2,
+            assignments: HashMap::from([(
+                "authored:site:charger".to_string(),
+                "KT-00000001".to_string(),
+            )]),
+            allocated: HashSet::from(["KT-00000001".to_string()]),
+        };
+        std::fs::write(&path, serde_json::to_vec(&previous).unwrap()).unwrap();
+
+        let result = atomic_replace_with(&path, b"new registry", |_, _| {
+            Err(std::io::Error::other("simulated replacement failure"))
+        });
+
+        assert!(result.is_err());
+        let restored: RegistryData =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored.assignments, previous.assignments);
+        assert_eq!(restored.allocated, previous.allocated);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use super::*;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn browser_storage_persists_and_restores_registry() {
+        let storage = PlatformIdentityStorage;
+        let data = RegistryData::default();
+        storage.save(&data).unwrap();
+        assert_eq!(storage.load().unwrap().unwrap().next_id, 1);
+        web_sys::window()
+            .unwrap()
+            .local_storage()
+            .unwrap()
+            .unwrap()
+            .remove_item(STORAGE_KEY)
+            .unwrap();
     }
 }

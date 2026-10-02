@@ -1353,6 +1353,13 @@ pub fn sync_chargers_with_grid(
 
     for (x, y, charger_pad_type) in diff.to_spawn.iter() {
         let grid_pos = SiteGrid::grid_to_world(*x, *y);
+        let grid_instance_id = multi_site
+            .active_site_mut()
+            .and_then(|site| site.grid.ensure_charger_instance_id(*x, *y));
+        let Some(grid_instance_id) = grid_instance_id else {
+            warn!("Missing charger identity on grid at ({x}, {y}) for site {site_id:?}");
+            continue;
+        };
 
         let power_kw = charger_pad_type.power_kw();
         let (bevy_charger_type, tier) = match charger_pad_type {
@@ -1397,6 +1404,7 @@ pub fn sync_chargers_with_grid(
         };
 
         let charger = Charger {
+            grid_instance_id: Some(grid_instance_id),
             id: format!("chg_{next_charger_num:02}"),
             name: format!("Charger {next_charger_num}"),
             charger_type: bevy_charger_type,

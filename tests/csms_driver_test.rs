@@ -112,6 +112,111 @@ async fn patches_only_when_existing_generic_metadata_differs() {
 }
 
 #[tokio::test]
+async fn configured_basic_auth_password_forces_reconciliation() {
+    let server = MockServer::start().await;
+    mount_driver(&server, &[1]).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/charge-points/KT-00000001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "KT-00000001",
+            "registration": "Accepted",
+            "security": { "profile": 1 },
+            "description": "Charger 1 — DC Fast 50 kW"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1/charge-points/KT-00000001"))
+        .and(body_json(serde_json::json!({
+            "registration": "Accepted",
+            "security": { "profile": 1, "basicAuthPassword": "rotated-secret" },
+            "description": "Charger 1 — DC Fast 50 kW"
+        })))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = CsmsDriverClient::new(CsmsDriverConfig::new(
+        server.uri(),
+        Duration::from_secs(2),
+        1,
+        Some("rotated-secret".to_string()),
+    ))
+    .unwrap();
+    client.provision(&provisioning()).await.unwrap();
+}
+
+#[test]
+fn basic_auth_requires_https_except_for_loopback_development() {
+    for url in [
+        "http://127.0.0.1:8787",
+        "http://localhost:8787",
+        "http://[::1]:8787",
+        "https://csms.example.com",
+    ] {
+        let config =
+            CsmsDriverConfig::new(url, Duration::from_secs(2), 1, Some("secret".to_string()));
+        assert!(
+            CsmsDriverClient::new(config).is_ok(),
+            "{url} should be allowed"
+        );
+    }
+
+    let remote = CsmsDriverConfig::new(
+        "http://csms.example.com",
+        Duration::from_secs(2),
+        1,
+        Some("secret".to_string()),
+    );
+    assert!(matches!(
+        CsmsDriverClient::new(remote),
+        Err(error) if error.kind() == CsmsDriverErrorKind::InvalidConfiguration
+    ));
+}
+
+#[tokio::test]
+async fn reconciles_a_create_conflict_by_reading_and_updating_the_winner() {
+    let server = MockServer::start().await;
+    mount_driver(&server, &[0]).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/charge-points/KT-00000001"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": { "code": "not_found", "message": "missing" }
+        })))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/charge-points/KT-00000001"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "KT-00000001",
+            "registration": "Rejected",
+            "security": { "profile": 0 },
+            "description": "old"
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/charge-points"))
+        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            "error": { "code": "conflict", "message": "already exists" }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path("/v1/charge-points/KT-00000001"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = CsmsDriverClient::new(config(server.uri())).unwrap();
+    client.provision(&provisioning()).await.unwrap();
+}
+
+#[tokio::test]
 async fn reports_unsupported_security_profiles_before_charge_point_reads() {
     let server = MockServer::start().await;
     mount_driver(&server, &[]).await;
