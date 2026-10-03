@@ -279,11 +279,23 @@ fn atomic_replace_with(
         }
     };
 
-    let result = replace(&temp_path, path).and_then(|_| std::fs::File::open(parent)?.sync_all());
+    let result = replace(&temp_path, path).and_then(|_| sync_parent_directory(parent));
     if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
         return Err("identity registry could not be persisted".to_string());
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(parent)?.sync_all()
+}
+
+// Windows does not support opening a directory as a regular File for fsync.
+// The replacement file itself was synced before the rename.
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -546,6 +558,36 @@ mod tests {
         drop(first);
         let second = PlatformIdentityStorage::open(path.clone()).unwrap();
         drop(second);
+        std::fs::remove_file(path.with_extension("json.lock")).unwrap();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn platform_registry_replaces_existing_file_and_restores_allocations() {
+        let path = std::env::temp_dir().join(format!(
+            "kilowatt-tycoon-identity-persistence-test-{}-{}.json",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first_id;
+        let second_id;
+        {
+            let storage = PlatformIdentityStorage::open(path.clone()).unwrap();
+            let mut registry = ChargerIdentityRegistry::load_with_storage(Box::new(storage));
+            first_id = registry.assign(Some("charger:first")).unwrap();
+            second_id = registry.assign(Some("charger:second")).unwrap();
+            assert_ne!(first_id, second_id);
+        }
+
+        {
+            let storage = PlatformIdentityStorage::open(path.clone()).unwrap();
+            let mut registry = ChargerIdentityRegistry::load_with_storage(Box::new(storage));
+            assert_eq!(registry.assign(Some("charger:first")).unwrap(), first_id);
+            assert_eq!(registry.assign(Some("charger:second")).unwrap(), second_id);
+            assert_eq!(registry.allocated_count(), 2);
+        }
+
+        std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(path.with_extension("json.lock")).unwrap();
     }
 }
