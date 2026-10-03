@@ -202,6 +202,7 @@ impl CsmsDriverClient {
         let client = reqwest::Client::builder()
             .timeout(config.timeout)
             .connect_timeout(connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| CsmsDriverError::new(CsmsDriverErrorKind::InvalidConfiguration))?;
         Ok(Self { config, client })
@@ -567,17 +568,36 @@ fn assign_identity(
     charger: &mut Charger,
     site: Option<&BelongsToSite>,
     identities: &mut ChargerIdentityRegistry,
-) -> Result<(), CsmsDriverErrorKind> {
+) -> Result<(), IdentityRegistryError> {
     identities
         .assign(stable_charger_key(charger, site).as_deref())
         .map(|cp_id| charger.cp_id = cp_id)
-        .map_err(|error| match error {
-            IdentityRegistryError::StorageUnavailable(_)
-            | IdentityRegistryError::CorruptRegistry => {
-                CsmsDriverErrorKind::IdentityStoreUnavailable
-            }
-            IdentityRegistryError::Exhausted => CsmsDriverErrorKind::IdentitySpaceExhausted,
-        })
+}
+
+fn identity_error_kind(error: &IdentityRegistryError) -> CsmsDriverErrorKind {
+    match error {
+        IdentityRegistryError::StorageUnavailable(_) | IdentityRegistryError::CorruptRegistry => {
+            CsmsDriverErrorKind::IdentityStoreUnavailable
+        }
+        IdentityRegistryError::Exhausted => CsmsDriverErrorKind::IdentitySpaceExhausted,
+    }
+}
+
+#[derive(Component)]
+#[doc(hidden)]
+pub struct IdentityAssignmentRetry {
+    attempts: u8,
+    retry_at: std::time::Instant,
+}
+
+const MAX_IDENTITY_RETRIES: u8 = 4;
+
+fn next_identity_retry(attempts: u8) -> IdentityAssignmentRetry {
+    let delay = std::time::Duration::from_secs(1_u64 << attempts.min(6));
+    IdentityAssignmentRetry {
+        attempts,
+        retry_at: std::time::Instant::now() + delay,
+    }
 }
 
 /// Assign stable identities once and start provisioning for newly-created chargers.
@@ -594,22 +614,40 @@ pub fn assign_charger_identities(
             &mut Charger,
             Option<&BelongsToSite>,
             Option<&CsmsProvisioningState>,
+            Option<&mut IdentityAssignmentRetry>,
         ),
-        Or<(Added<Charger>, Changed<CsmsProvisioningState>)>,
+        Or<(Added<Charger>, With<IdentityAssignmentRetry>)>,
     >,
 ) {
-    for (entity, mut charger, site, state) in &mut chargers {
+    for (entity, mut charger, site, state, retry) in &mut chargers {
         if !charger.cp_id.is_empty() && state.is_some() {
             continue;
         }
-        if charger.cp_id.is_empty()
-            && let Err(kind) = assign_identity(&mut charger, site, &mut identities)
-        {
-            warn!("Charger identity assignment failed: {kind}");
-            commands
-                .entity(entity)
-                .insert(CsmsProvisioningState::Failed(kind));
-            continue;
+        if charger.cp_id.is_empty() {
+            if retry
+                .as_ref()
+                .is_some_and(|retry| retry.retry_at > std::time::Instant::now())
+            {
+                continue;
+            }
+            if let Err(error) = assign_identity(&mut charger, site, &mut identities) {
+                let kind = identity_error_kind(&error);
+                warn!("Charger identity assignment failed: {kind}");
+                let mut entity_commands = commands.entity(entity);
+                entity_commands.insert(CsmsProvisioningState::Failed(kind));
+                if matches!(error, IdentityRegistryError::StorageUnavailable(_)) {
+                    let attempts = retry.as_ref().map_or(0, |retry| retry.attempts + 1);
+                    if attempts < MAX_IDENTITY_RETRIES {
+                        entity_commands.insert(next_identity_retry(attempts));
+                    } else {
+                        entity_commands.remove::<IdentityAssignmentRetry>();
+                    }
+                } else {
+                    entity_commands.remove::<IdentityAssignmentRetry>();
+                }
+                continue;
+            }
+            commands.entity(entity).remove::<IdentityAssignmentRetry>();
         }
 
         if let Some(config_error) = &config_error {
@@ -695,6 +733,10 @@ mod tests {
             ))
         );
 
+        app.world_mut()
+            .get_mut::<IdentityAssignmentRetry>(entity)
+            .unwrap()
+            .retry_at = std::time::Instant::now() - std::time::Duration::from_millis(1);
         app.update();
         assert_eq!(
             app.world().get::<Charger>(entity).unwrap().cp_id,
@@ -727,6 +769,48 @@ mod tests {
                 CsmsDriverErrorKind::InvalidConfiguration
             ))
         );
+    }
+
+    #[test]
+    fn persistent_identity_store_failure_is_throttled_and_retries_are_bounded() {
+        use std::sync::atomic::AtomicUsize;
+
+        let saves = std::sync::Arc::new(AtomicUsize::new(0));
+        let mut app = App::new();
+        app.insert_resource(
+            ChargerIdentityRegistry::in_memory_with_persistent_save_failure(saves.clone()),
+        )
+        .init_resource::<ProvisioningTaskRegistry>()
+        .add_systems(Update, assign_charger_identities);
+        let entity = app.world_mut().spawn(Charger::default()).id();
+
+        app.update();
+        for _ in 0..20 {
+            app.update();
+        }
+        assert_eq!(saves.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Advance the retry deadline directly so the test covers the bounded
+        // retry policy without sleeping through its exponential backoff.
+        for _ in 0..MAX_IDENTITY_RETRIES {
+            {
+                let mut retry = app
+                    .world_mut()
+                    .get_mut::<IdentityAssignmentRetry>(entity)
+                    .expect("transient storage failures retain a retry marker");
+                retry.retry_at = std::time::Instant::now() - std::time::Duration::from_millis(1);
+            }
+            app.update();
+        }
+        assert!(app.world().get::<IdentityAssignmentRetry>(entity).is_none());
+        for _ in 0..20 {
+            app.update();
+        }
+        assert_eq!(
+            saves.load(std::sync::atomic::Ordering::Relaxed),
+            usize::from(MAX_IDENTITY_RETRIES) + 1
+        );
+        assert!(app.world().get::<Charger>(entity).unwrap().cp_id.is_empty());
     }
 
     #[test]
@@ -877,22 +961,40 @@ pub fn assign_charger_identities(
             &mut Charger,
             Option<&BelongsToSite>,
             Option<&CsmsProvisioningState>,
+            Option<&mut IdentityAssignmentRetry>,
         ),
-        Or<(Added<Charger>, Changed<CsmsProvisioningState>)>,
+        Or<(Added<Charger>, With<IdentityAssignmentRetry>)>,
     >,
 ) {
-    for (entity, mut charger, site, state) in &mut chargers {
+    for (entity, mut charger, site, state, retry) in &mut chargers {
         if !charger.cp_id.is_empty() && state.is_some() {
             continue;
         }
-        if charger.cp_id.is_empty()
-            && let Err(kind) = assign_identity(&mut charger, site, &mut identities)
-        {
-            warn!("Charger identity assignment failed: {kind}");
-            commands
-                .entity(entity)
-                .insert(CsmsProvisioningState::Failed(kind));
-            continue;
+        if charger.cp_id.is_empty() {
+            if retry
+                .as_ref()
+                .is_some_and(|retry| retry.retry_at > std::time::Instant::now())
+            {
+                continue;
+            }
+            if let Err(error) = assign_identity(&mut charger, site, &mut identities) {
+                let kind = identity_error_kind(&error);
+                warn!("Charger identity assignment failed: {kind}");
+                let mut entity_commands = commands.entity(entity);
+                entity_commands.insert(CsmsProvisioningState::Failed(kind));
+                if matches!(error, IdentityRegistryError::StorageUnavailable(_)) {
+                    let attempts = retry.as_ref().map_or(0, |retry| retry.attempts + 1);
+                    if attempts < MAX_IDENTITY_RETRIES {
+                        entity_commands.insert(next_identity_retry(attempts));
+                    } else {
+                        entity_commands.remove::<IdentityAssignmentRetry>();
+                    }
+                } else {
+                    entity_commands.remove::<IdentityAssignmentRetry>();
+                }
+                continue;
+            }
+            commands.entity(entity).remove::<IdentityAssignmentRetry>();
         }
         commands
             .entity(entity)

@@ -36,8 +36,7 @@ impl std::error::Error for IdentityRegistryError {}
 struct RegistryData {
     version: u32,
     next_id: u64,
-    /// Stable keys are used for authored chargers. Dynamically placed chargers
-    /// receive unkeyed IDs so removing and rebuilding one can never recycle it.
+    /// Stable keys are used for authored chargers and persistent grid instance IDs.
     assignments: HashMap<String, String>,
     /// Kept for the lifetime of the registry; retired IDs remain reserved.
     allocated: HashSet<String>,
@@ -172,6 +171,24 @@ impl ChargerIdentityRegistry {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         Self::load_with_storage(Box::new(storage))
     }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory_with_persistent_save_failure(
+        saves: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        struct AlwaysFailingStorage(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl IdentityStorage for AlwaysFailingStorage {
+            fn load(&self) -> Result<Option<RegistryData>, String> {
+                Ok(None)
+            }
+
+            fn save(&self, _data: &RegistryData) -> Result<(), String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err("persistent simulated write failure".to_string())
+            }
+        }
+        Self::load_with_storage(Box::new(AlwaysFailingStorage(saves)))
+    }
 }
 
 fn data_is_valid(data: &RegistryData) -> bool {
@@ -184,12 +201,17 @@ fn data_is_valid(data: &RegistryData) -> bool {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-struct PlatformIdentityStorage(std::path::PathBuf);
+struct PlatformIdentityStorage {
+    path: std::path::PathBuf,
+    // Held for the lifetime of the registry to enforce a single writer for this
+    // local allocation history, including across game processes.
+    _writer_lock: std::fs::File,
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 impl IdentityStorage for PlatformIdentityStorage {
     fn load(&self) -> Result<Option<RegistryData>, String> {
-        match std::fs::read(&self.0) {
+        match std::fs::read(&self.path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
                 .map_err(|_| "identity registry could not be decoded".to_string()),
@@ -200,14 +222,14 @@ impl IdentityStorage for PlatformIdentityStorage {
 
     fn save(&self, data: &RegistryData) -> Result<(), String> {
         let parent = self
-            .0
+            .path
             .parent()
             .ok_or_else(|| "identity registry path is invalid".to_string())?;
         std::fs::create_dir_all(parent)
             .map_err(|_| "identity registry directory could not be created".to_string())?;
         let bytes = serde_json::to_vec(data)
             .map_err(|_| "identity registry could not be encoded".to_string())?;
-        atomic_replace(&self.0, &bytes)
+        atomic_replace(&self.path, &bytes)
     }
 }
 
@@ -272,11 +294,43 @@ fn platform_storage() -> Box<dyn IdentityStorage> {
     let Some(project_dirs) = ProjectDirs::from("com", "juherr", "Kilowatt Tycoon") else {
         return Box::new(UnavailableStorage("application data directory unavailable"));
     };
-    Box::new(PlatformIdentityStorage(
-        project_dirs
-            .data_local_dir()
-            .join("charge-point-identities.json"),
-    ))
+    let path = project_dirs
+        .data_local_dir()
+        .join("charge-point-identities.json");
+    match PlatformIdentityStorage::open(path) {
+        Ok(storage) => Box::new(storage),
+        Err(_) => Box::new(UnavailableStorage(
+            "identity registry is already in use by another game process",
+        )),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PlatformIdentityStorage {
+    fn open(path: std::path::PathBuf) -> Result<Self, String> {
+        use fs2::FileExt;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| "identity registry path is invalid".to_string())?;
+        std::fs::create_dir_all(parent)
+            .map_err(|_| "identity registry directory could not be created".to_string())?;
+        let lock_path = path.with_extension("json.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .map_err(|_| "identity registry writer lock could not be opened".to_string())?;
+        lock_file.try_lock_exclusive().map_err(|_| {
+            "identity registry is already in use by another game process".to_string()
+        })?;
+        Ok(Self {
+            path,
+            _writer_lock: lock_file,
+        })
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -478,25 +532,20 @@ mod tests {
         assert_eq!(restored.allocated, previous.allocated);
         std::fs::remove_file(path).unwrap();
     }
-}
 
-#[cfg(all(test, target_arch = "wasm32"))]
-mod wasm_tests {
-    use super::*;
-    use wasm_bindgen_test::wasm_bindgen_test;
-
-    #[wasm_bindgen_test]
-    fn browser_storage_persists_and_restores_registry() {
-        let storage = PlatformIdentityStorage;
-        let data = RegistryData::default();
-        storage.save(&data).unwrap();
-        assert_eq!(storage.load().unwrap().unwrap().next_id, 1);
-        web_sys::window()
-            .unwrap()
-            .local_storage()
-            .unwrap()
-            .unwrap()
-            .remove_item(STORAGE_KEY)
-            .unwrap();
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn only_one_registry_writer_can_hold_the_same_installation_registry() {
+        let path = std::env::temp_dir().join(format!(
+            "kilowatt-tycoon-identity-lock-test-{}-{}.json",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = PlatformIdentityStorage::open(path.clone()).unwrap();
+        assert!(PlatformIdentityStorage::open(path.clone()).is_err());
+        drop(first);
+        let second = PlatformIdentityStorage::open(path.clone()).unwrap();
+        drop(second);
+        std::fs::remove_file(path.with_extension("json.lock")).unwrap();
     }
 }

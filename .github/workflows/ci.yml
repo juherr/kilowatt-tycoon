@@ -139,7 +139,7 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Run wasm-bindgen-test in headless Chrome
+      - name: Run WASM browser integration tests in headless Chrome
         run: wasm-pack test --headless --chrome
 
 

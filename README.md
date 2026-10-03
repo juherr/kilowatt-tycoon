@@ -53,8 +53,16 @@ Provisioning is disabled when `CSMS_DRIVER_URL` is unset; the game remains
 playable locally. Optional settings are `CSMS_DRIVER_TIMEOUT_MS` (defaults to
 60000), `CSMS_DRIVER_SECURITY_PROFILE` (defaults to `0`), and
 `CSMS_DRIVER_BASIC_AUTH_PASSWORD` for security profiles 1 or 2. The password
-is sent only in the provisioning request and is redacted from client errors.
-Browser builds do not call the daemon directly.
+is sent only in provisioning requests and is redacted from client errors.
+Profiles 1 and 2 require an HTTPS daemon URL outside loopback development
+endpoints. Redirects are not followed, so credentials stay on the configured
+daemon origin. Browser builds do not call the daemon directly.
+
+The durable identity registry is the allocation authority for one game
+installation. Only one running game process can hold its writer lock. Keep each
+installation paired with its own CSMS daemon; separate installations have
+separate registries and can allocate the same `KT-...` IDs, so they must not
+share a CSMS charge-point namespace.
 
 ### WASM
 

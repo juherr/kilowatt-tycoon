@@ -176,6 +176,53 @@ fn basic_auth_requires_https_except_for_loopback_development() {
 }
 
 #[tokio::test]
+async fn does_not_follow_redirects_with_basic_auth_credentials() {
+    let server = MockServer::start().await;
+    let redirect_target = MockServer::start().await;
+    mount_driver(&server, &[1]).await;
+    Mock::given(method("GET"))
+        .and(path("/v1/charge-points/KT-00000001"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": { "code": "not_found", "message": "missing" }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/charge-points"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("Location", format!("{}/steal", redirect_target.uri())),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&redirect_target)
+        .await;
+
+    let client = CsmsDriverClient::new(CsmsDriverConfig::new(
+        server.uri(),
+        Duration::from_secs(2),
+        1,
+        Some("secret".to_string()),
+    ))
+    .unwrap();
+    assert!(matches!(
+        client.provision(&provisioning()).await,
+        Err(error) if error.kind() == CsmsDriverErrorKind::HttpFailure
+    ));
+    assert!(
+        redirect_target
+            .received_requests()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn reconciles_a_create_conflict_by_reading_and_updating_the_winner() {
     let server = MockServer::start().await;
     mount_driver(&server, &[0]).await;
