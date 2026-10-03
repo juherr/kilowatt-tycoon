@@ -42,8 +42,9 @@ python3 tools/build_assets.py
 
 ### CSMS provisioning
 
-Native builds can provision newly created chargers through the language-neutral
-`csms-driver` daemon. Start the daemon separately, then configure the game:
+Native local builds can provision newly created chargers through the
+language-neutral `csms-driver` daemon. Start the daemon separately, then
+configure the game:
 
 ```bash
 CSMS_DRIVER_URL=http://127.0.0.1:8787 cargo run
@@ -58,11 +59,13 @@ Profiles 1 and 2 require an HTTPS daemon URL outside loopback development
 endpoints. Redirects are not followed, so credentials stay on the configured
 daemon origin. Browser builds do not call the daemon directly.
 
-The durable identity registry is the allocation authority for one game
-installation. Only one running game process can hold its writer lock. Keep each
-installation paired with its own CSMS daemon; separate installations have
-separate registries and can allocate the same `KT-...` IDs, so they must not
-share a CSMS charge-point namespace.
+This native integration and the durable local identity registry are
+preparatory infrastructure for isolated local deployments. Their `KT-...`
+identities are allocated per registry and are not globally unique across
+hosted sessions. Only one local game process can hold the registry writer
+lock. Hosted WASM provisioning must go through the Kilowatt orchestration
+backend, which will own globally unique identities and enforce session
+ownership before calling `csms-driver`.
 
 ### WASM
 
