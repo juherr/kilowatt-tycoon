@@ -70,6 +70,8 @@ openleadr-wire = { version = "0.1", default-features = false, optional = true }
 bevy = { version = "0.17", default-features = false, features = ["bevy_audio", "vorbis"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+directories = "6"
+fs2 = "0.4"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"], optional = true }
 futures-util = { version = "0.3", optional = true }
 webbrowser = "1"
@@ -93,7 +95,7 @@ wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["HtmlAudioElement", "HtmlMediaElement", "Document", "Window", "Location", "WebSocket", "BinaryType", "MessageEvent"] }
+web-sys = { version = "0.3", features = ["HtmlAudioElement", "HtmlMediaElement", "Document", "Window", "Location", "Storage", "WebSocket", "BinaryType", "MessageEvent"] }
 
 # Enable optimization in dev for faster runtime
 [profile.dev]

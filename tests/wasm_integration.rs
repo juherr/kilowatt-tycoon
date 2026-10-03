@@ -7,6 +7,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
+use kilowatt_tycoon::resources::ChargerIdentityRegistry;
 use wasm_bindgen_test::*;
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -59,4 +60,32 @@ fn can_read_viewport_dimensions() {
         height > 0.0,
         "viewport height should be positive, got {height}"
     );
+}
+
+#[wasm_bindgen_test]
+fn wasm_integration_browser_storage_persists_and_restores_registry() {
+    let storage = web_sys::window()
+        .expect("window")
+        .local_storage()
+        .expect("localStorage")
+        .expect("localStorage is available");
+    storage
+        .remove_item("kilowatt-tycoon.charge-point-identities.v1")
+        .unwrap();
+
+    let mut registry = ChargerIdentityRegistry::load_default();
+    let assigned = registry
+        .assign(Some("wasm-browser-storage-regression"))
+        .unwrap();
+    let mut restored = ChargerIdentityRegistry::load_default();
+    assert_eq!(
+        restored
+            .assign(Some("wasm-browser-storage-regression"))
+            .unwrap(),
+        assigned
+    );
+
+    storage
+        .remove_item("kilowatt-tycoon.charge-point-identities.v1")
+        .unwrap();
 }

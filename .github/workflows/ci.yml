@@ -139,8 +139,27 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Run wasm-bindgen-test in headless Chrome
+      - name: Run WASM browser integration tests in headless Chrome
         run: wasm-pack test --headless --chrome
+
+
+  windows-identity-storage:
+    name: Windows Identity Registry Persistence
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+          cache-targets: true
+
+      - name: Test atomic identity registry replacement
+        run: cargo test --lib resources::charger_identity::tests::platform_registry_replaces_existing_file_and_restores_allocations -- --exact
 
 
   e2e-mobile:

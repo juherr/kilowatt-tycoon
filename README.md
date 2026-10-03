@@ -40,6 +40,33 @@ cargo test
 python3 tools/build_assets.py
 ```
 
+### CSMS provisioning
+
+Native local builds can provision newly created chargers through the
+language-neutral `csms-driver` daemon. Start the daemon separately, then
+configure the game:
+
+```bash
+CSMS_DRIVER_URL=http://127.0.0.1:8787 cargo run
+```
+
+Provisioning is disabled when `CSMS_DRIVER_URL` is unset; the game remains
+playable locally. Optional settings are `CSMS_DRIVER_TIMEOUT_MS` (defaults to
+60000), `CSMS_DRIVER_SECURITY_PROFILE` (defaults to `0`), and
+`CSMS_DRIVER_BASIC_AUTH_PASSWORD` for security profiles 1 or 2. The password
+is sent only in provisioning requests and is redacted from client errors.
+Profiles 1 and 2 require an HTTPS daemon URL outside loopback development
+endpoints. Redirects are not followed, so credentials stay on the configured
+daemon origin. Browser builds do not call the daemon directly.
+
+This native integration and the durable local identity registry are
+preparatory infrastructure for isolated local deployments. Their `KT-...`
+identities are allocated per registry and are not globally unique across
+hosted sessions. Only one local game process can hold the registry writer
+lock. Hosted WASM provisioning must go through the Kilowatt orchestration
+backend, which will own globally unique identities and enforce session
+ownership before calling `csms-driver`.
+
 ### WASM
 
 Test the game locally in the browser:

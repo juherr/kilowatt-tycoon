@@ -253,6 +253,10 @@ impl RemoteAction {
 /// Main charger component
 #[derive(Component, Debug, Clone)]
 pub struct Charger {
+    /// Stable external OCPP charge-point identity; distinct from the local display ID.
+    pub cp_id: String,
+    /// Stable identity of a grid placement, stored on its charger-pad tile.
+    pub grid_instance_id: Option<String>,
     pub id: String,
     pub name: String,
     pub charger_type: ChargerType,
@@ -332,6 +336,8 @@ pub struct Charger {
 impl Default for Charger {
     fn default() -> Self {
         Self {
+            cp_id: String::new(),
+            grid_instance_id: None,
             id: String::new(),
             name: String::new(),
             charger_type: ChargerType::DcFast,
